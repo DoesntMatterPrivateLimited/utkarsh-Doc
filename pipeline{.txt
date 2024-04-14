@@ -1,0 +1,142 @@
+pipeline{
+    agent any
+    tools{
+        jdk 'jdk17'
+        nodejs 'node16'
+    }
+    environment {
+        SCANNER_HOME=tool 'sonar-scanner'
+        AWS_DEFAULT_REGION = 'ap-south-2'
+        ECR_REPO = 'zomato'
+        
+    }
+    stages {
+        stage('clean workspace'){
+            steps{
+                cleanWs()
+            }
+        }
+        stage('Checkout from Git'){
+            steps{
+                git branch: 'main', url: 'https://github.com/DoesntMatterPrivateLimited/pk_zomato.git'
+            }
+        }
+        stage("Sonarqube Analysis "){
+            steps{
+                withSonarQubeEnv('sonar-server') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Netflix \
+                    -Dsonar.projectKey=Netflix '''
+                }
+            }
+        }
+        // stage("quality gate"){
+        //   steps {
+        //         script {
+        //             waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token' 
+        //         }
+        //     } 
+        // }
+        stage('Install Dependencies') {
+            steps {
+                sh "npm install"
+            }
+        }
+        // stage('OWASP FS SCAN') {
+        //     steps {
+        //         dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+        //         dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+        //     }
+        // }
+        stage('TRIVY FS SCAN') {
+            steps {
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+            stage('ecr login') {
+            steps {
+                script {
+                    docker.withRegistry('https://590183663006.dkr.ecr.ap-south-2.amazonaws.com', 'ecr:ap-south-2:awscreds') {
+                        // Inside this block, you can perform Docker-related operations
+                    }
+                }
+            }
+        }
+            // stage('ecr image build and tag') {
+            // steps {
+            //     script {
+            //         sh '''
+            //         docker build -t zomato .
+            //         docker tag zomato:latest 590183663006.dkr.ecr.ap-south-2.amazonaws.com/zomato:latest
+                    
+            //         '''
+            //         }
+            //     }
+            // }
+            
+            stage('ecr image push') {
+            steps {
+                script {
+                    
+                    docker.withRegistry ('https://590183663006.dkr.ecr.ap-south-2.amazonaws.com', 'ecr:ap-south-2:awscreds'){
+                    docker.image('zomato:latest').push('latest')
+                        
+                    }
+                    
+                    }
+                }
+            }
+            stage('load balancer') {
+            steps {
+                
+            withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'awscreds', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    sh '''
+                    aws elbv2 create-target-group --name tg1 --protocol HTTP --port 80 --vpc-id vpc-0e3a99ba27ae8a71c --target-type ip --ip-address-type ipv4
+                    aws elbv2 create-load-balancer --name zomato --subnets subnet-0abfaaa33ce7d7693 subnet-09e4560f5b398c7cb --security-groups sg-072b3bbafdb2ad46e
+                    aws elbv2 create-listener --load-balancer-arn arn:aws:elasticloadbalancing:ap-south-2:590183663006:loadbalancer/app/zomato/b41cc28a96a6bf57 --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:ap-south-2:590183663006:targetgroup/tg1/062e93db68af4803
+
+                    
+                    '''
+}
+                   
+                    
+                }
+            }
+            
+            stage('ecs') {
+            steps {
+                withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'awscreds', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                sh '''
+                    aws ecs create-cluster --cluster-name zomato
+                    aws ecs register-task-definition --cli-input-json file://./zm.json --region ap-south-2
+                    '''
+}
+               
+            }
+            
+        }
+        stage('Deploy ECS Service') {
+            steps {
+                script{
+                withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'awscreds', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]){
+                    def clusterName = 'zomato'
+                    def serviceName = 'zservice'
+                    def taskDefinition = 'zomatotd:2'
+                    def desiredCount = 1
+                    def launchType = 'FARGATE'
+                    def platformVersion = 'LATEST'
+                    def subnets = 'subnet-0abfaaa33ce7d7693'
+                    def securityGroups = 'sg-072b3bbafdb2ad46e'
+                    def loadBalancerJson = "{\"targetGroupArn\": \"arn:aws:elasticloadbalancing:ap-south-2:590183663006:targetgroup/tg1/062e93db68af4803\", \"containerName\": \"zomato\", \"containerPort\": 3000}"
+
+                    sh "aws ecs create-service --cluster ${clusterName} --service-name ${serviceName} --task-definition ${taskDefinition} --desired-count ${desiredCount} --launch-type ${launchType} --platform-version ${platformVersion} --load-balancers '${loadBalancerJson}' --network-configuration 'awsvpcConfiguration={subnets=[${subnets}],securityGroups=[${securityGroups}],assignPublicIp=ENABLED}'"
+                    // sh "aws ecs create-service --cluster ${clusterName} --service-name ${serviceName} --task-definition ${taskDefinition} --desired-count ${desiredCount} --launch-type ${launchType} --platform-version ${platformVersion} --load-balancers [{\"targetGroupArn\": \"arn:aws:elasticloadbalancing:ap-south-2:590183663006:targetgroup/tg1/9a198ac210c109cb\", \"containerName\": \"zomato\", \"containerPort\": 80}] --network-configuration 'awsvpcConfiguration={subnets=[${subnets}],securityGroups=[${securityGroups}],assignPublicIp=ENABLED}'"
+                }
+                }
+            }
+        }
+        
+
+        
+     }
+    
+}
